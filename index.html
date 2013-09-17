@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>drawing</title>
+
+    <script src="https://cdn.firebase.com/v0/firebase.js"></script>
+    <script type="text/javascript">
+      var inkCanvas;
+      var inkContext;
+      var statusMessage;
+      var addingLocalPath;
+      var drawingRef;
+      var currentPath = [];
+      var PIXEL_SIZE = 8; // To match Android(?).
+      var mousedown;
+
+      function initialize() {
+          // obtain inkCanvas and inkContext variables from html
+          // also set some default values
+          inkCanvas = document.getElementById("inkCanvas");
+          inkCanvas.width = window.innerWidth - 10;
+          inkCanvas.height = window.innerHeight - 32;
+          inkContext = inkCanvas.getContext("2d");
+          inkContext.lineCap = "round";
+          inkContext.lineJoin = "round";
+          
+          // register hooks for input processing: pointer down/update/up messages for inkCanvas element
+          inkCanvas.addEventListener("mousedown", onPointerDown, false);
+          inkCanvas.addEventListener("mousemove", onPointerUpdate, false);
+          inkCanvas.addEventListener("mouseup", onPointerUp, false);
+
+          // obtain statusMessage variable from html
+          // set initial value to the default (currentRecognizerId = 0) recognizer name
+          statusMessage = document.getElementById("statusMessage");
+
+          drawingRef = new Firebase('https://android-drawing.firebaseio-demo.com/');
+
+          drawingRef.on('child_added', function(s) {
+              // If we are adding this path, we already rendered it.
+              if (!addingLocalPath) {
+                  renderPath(s);
+              }
+          });
+
+          // If something's removed, re-render everything.
+          var rerenderQueued;
+          drawingRef.on('child_removed', function(s) {
+              // Typically, the whole canvas is being cleared, so we'll get a bunch of child_removeds.  Rather than redraw the canvas
+              // a bunch of times, we use a timeout to wait until we get them all and then do it.
+              if (!rerenderQueued) {
+                  rerenderQueued = true;
+                  rerenderTimeout = setTimeout(function() {
+                      rerenderQueued = false;
+                      renderAllPaths();
+                  }, 0);
+              }
+          });
+      }
+      document.addEventListener("DOMContentLoaded", initialize, false);
+
+      // global current values of the recognized text, current inking color, current inking width and current recognizer id
+      var currentColor = "000000";
+      var lastPos;
+
+      // --- input processing ------
+      // occurs when pointer (touch, pen, mouse) first comes in contact with inkCanvas
+      // this is the first message for every stroke
+      function onPointerDown(evt) {
+        mousedown = true;
+        // ink mode
+        statusMessage.innerText = "";
+
+        // setup drawing attributes for live rendering
+        // in inking mode we render the stroke
+        inkContext.lineWidth = 1;
+        inkContext.strokeStyle = '#' + currentColor;
+
+        // start live rendering
+        inkContext.beginPath();
+        inkContext.moveTo(evt.clientX, evt.clientY);
+        lastPos = { x: evt.clientX / PIXEL_SIZE, y: evt.clientY / PIXEL_SIZE };
+        currentPath.push(lastPos);
+      }
+
+      // for mouse messages occurs when pointer (mouse) contact is moved
+      // for touch and pen messages occurs at steady rate (say 100 messages per second) regardless of whether the contact moved
+      function onPointerUpdate(evt) {
+          // we only allow one contact at the time, currentPenId is set in pointer down event handler
+          if (mousedown) {
+              var pos = {x: evt.clientX / PIXEL_SIZE, y: evt.clientY / PIXEL_SIZE }
+              if (Math.abs(pos.x - lastPos.x) > 1 || Math.abs(pos.y - lastPos.y) > 1) {
+
+                  // live rendering is done here
+                  inkContext.quadraticCurveTo(lastPos.x * PIXEL_SIZE, lastPos.y * PIXEL_SIZE, (pos.x + lastPos.x) * PIXEL_SIZE / 2, (pos.y + lastPos.y) * PIXEL_SIZE / 2);
+                  inkContext.stroke();
+
+                  currentPath.push(pos);
+                  lastPos = pos;
+              }
+          }
+      }
+
+      // occurs when pointer (touch, pen, mouse) leaves inkCanvas
+      // this is the last message for every stroke
+      function onPointerUp(evt) {
+          if (mousedown) {
+              mousedown = false;
+
+              // done with live rendering
+              inkContext.closePath();
+
+              statusMessage.innerText = "";
+
+              addingLocalPath = true;
+              drawingRef.push({
+                  color: hexColorToInt(currentColor),
+                  points: currentPath
+              });
+              currentPath = [];
+              addingLocalPath = false;
+          }
+      }
+      
+      // convert Windows.UI.Color to color string
+      function toColorString(color) {
+          return "#" + byteHex(color.r) + byteHex(color.g) + byteHex(color.b);
+      }
+
+      function hexColorToInt(hexColor) {
+          hexColor = 'ff' + hexColor;
+          var int = parseInt(hexColor, 16);
+          // convert to a signed 32-bit int.
+          if (int > 2147483647) {
+              int -= 4294967296;
+          }
+          return int;
+      }
+
+      function hexColorFromInt(int) {
+          if (int < 0) {
+              int += 4294967296;
+          }
+          var hex = int.toString(16);
+          while (hex.length < 6) {
+              hex = "0" + hex;
+          }
+          hex = hex.substr(hex.length - 6); // strip off alpha if it's there.
+          return hex;
+      }
+
+      function renderPath(pathSnap) {
+          var color = hexColorFromInt(pathSnap.child('color').val());
+          var points = pathSnap.child('points').val();
+          inkContext.strokeStyle = '#' + color;
+          inkContext.lineWidth = 1;
+          inkContext.beginPath();
+
+          for(var i = 0; i < points.length; i++) {
+              if (i === 0) {
+                  inkContext.moveTo(points[i].x * PIXEL_SIZE, points[i].y * PIXEL_SIZE);
+              } else {
+                  inkContext.quadraticCurveTo(points[i-1].x * PIXEL_SIZE, points[i-1].y * PIXEL_SIZE,
+                      (points[i - 1].x + points[i].x) * PIXEL_SIZE / 2, (points[i-1].y + points[i].y) * PIXEL_SIZE / 2);
+              }
+          }
+          inkContext.stroke();
+          inkContext.closePath();
+      }
+
+      // clear the entire canvas and render all strokes using bezier curves
+      function renderAllPaths() {
+          inkContext.clearRect(0, 0, inkCanvas.width, inkCanvas.height);
+
+          drawingRef.once('value', function(drawingSnap) {
+              drawingSnap.forEach(function(pathSnap) {
+                  renderPath(pathSnap);
+              });
+          });
+      }
+    
+    </script>
+</head>
+<body role="application">
+    <div>
+        <canvas id="inkCanvas"></canvas>
+    </div>
+    <div id="statusMessage" aria-label="status message" aria-live="polite" role="region"></div>
+</body>
+</html>
+
+
+
